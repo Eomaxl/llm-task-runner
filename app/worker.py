@@ -3,54 +3,45 @@ import asyncio
 import time
 from typing import Any, Dict
 
-from .models import Task, StepRecord
+from .models import StepRecord
 from .store import InMemoryStore
 from .metrics import metrics
 from .config import settings
 from .retry import retry_async, RetryError
-from .planner import planner
+from .redis_store import RedisStore
+from .redis_queue import RedisQueue
+from .openai_planner import planner
 from . import tools
 
-class TaskQueue:
-    def __init__(self) -> None:
-        self.q: asyncio.Queue[str] = asyncio.Queue()
-
-    async def put(self, task_id: str)-> None:
-        await self.q.put(task_id)
-
-    async def get(self) -> str:
-        return await self.q.get()
-    
-task_queue = TaskQueue()
-
 class Worker:
-    def __init__(self, store: InMemoryStore) -> None:
+    def __init__(self, store: RedisStore, queue: RedisQueue) -> None:
         self.store = store
+        self.queue = queue
         self._sem = asyncio.Semaphore(settings.max_concurrent_tasks)
         self._running = False
-        self._bg_task: asyncio.Task | None = None
+        self._bg: asyncio.Task | None = None
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._bg_task = asyncio.create_task(self._run_loop())
+        self._bg = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
         self._running = False
-        if self._bg_task:
-            self._bg_task.cancel()
+        if self._bg:
+            self._bg.cancel()
             try:
-                await self._bg_task
+                await self._bg
             except Exception:
                 pass
     
-    async def run_loop(self) -> None:
+    async def _loop(self) -> None:
         while self._running:
-            task_id = await task_queue.get()
-            asyncio.create_task(self._guarded_execute(task_id))
+            task_id = await self.queue.dequeue_blocking(timeout_s=1)
+            asyncio.create_task(self._guarded(task_id))
     
-    async def _guarded_execute(self, task_id: str) -> None:
+    async def _guarded(self, task_id: str) -> None:
         async with self._sem:
             await self._execute(task_id)
 
@@ -62,65 +53,58 @@ class Worker:
         if task.status in ("succeeded", "failed"):
             return
         
-        task.status = "running"
+        await self.store.update_task_fields(task_id, status="running")
         await metrics.inc("tasks_running",1)
-        await self.store.update_task(task)
 
         try:
-            await self._run_workflow(task)
-            task.status = "succeeded"
+            await self._workflow(task_id, task.goal)
+            await self.store.update_task_fields(task_id, status="succeeded", result="Completed")
             await metrics.inc("tasks_succeeded", 1)
         except Exception as e:
-            task.status = "failed"
-            task.error = str(e)
+            await self.store.update_task_fields(task_id, status="failed", error=str(e))
             await metrics.inc("tasks_failed",1)
         finally:
             await metrics.dec("tasks_running", 1)
-            await self.store.update_task(task)
 
-    async def _run_workflow(self, task:Task) -> None:
+    async def _workflow(self, task_id: str, goal: str) -> None:
         # PLAN step
         t0 = time.perf_counter()
-        steps = planner.plan(task.goal)
+        planned = planner.plan(goal)
         await metrics.inc("llm_plans", 1)
 
-        task.steps.append(
+        await self.store.append_step(
+            task_id,
             StepRecord(
-                step_no=len(task.steps)+ 1,
+                step_no=1,
                 kind = "plan",
-                name="local_planner",
-                input= {"goal": task.goal},
-                output= {"planned_steps": steps},
+                name="openai_planner",
+                input= {"goal": goal},
+                output= {"planned_steps": planned},
                 ok = True,
                 latency_ms=int((time.perf_counter() - t0) * 1000),
-            )
+            ),
         )
-        await self.store.update_task(task)
+        
 
         #Enforce step limits:
-        if len(steps) > settings.max_steps:
-            raise RuntimeError(f"too many steps planned : {len(steps)} > {settings.max_steps}")
+        if len(planned) > settings.max_steps:
+            raise RuntimeError(f"too many steps planned : {len(planned)} > {settings.max_steps}")
         
         #Execute tool steps:
-        observations: Dict[str, Any] = {}
-        for i,st in enumerate(steps, start = 1):
+        step_no = 2
+        for idx, st in enumerate(planned, start = 1):
             tool = st["tool"]
             args = st["args"]
+            record = StepRecord(step_no=step_no, kind="tool", name=tool_name, input=args)
+            step_no += 1
 
             # Step timeout wrapper
             async def run_one() -> Dict[str, Any]:
                 return await self._call_tool(tool, args)
             
-            step_t0 = time.perf_counter()
-            record = StepRecord(
-                step_no=len(task.steps) + 1,
-                kind = "tool",
-                name = tool,
-                input = args,
-            )
-
+            s0 = time.perf_counter()
             try:
-                result = await asyncio.wait_for(
+                out = await asyncio.wait_for(
                     retry_async(
                         lambda: run_one(),
                         attempts= settings.retry_max_attempts,
@@ -132,35 +116,22 @@ class Worker:
                     timeout = settings.step_timeout_seconds,
                 )
                 record.ok = True
-                record.output = result
-                observations[f"{tool}_{i}"] = result
+                record.output = out
+                await metrics.inc("tool_calls",1)
             except asyncio.TimeoutError:
                 record.ok = False
                 record.error = f"step timeout after {settings.step_timeout_seconds}s"
                 await metrics.inc("tool_failure",1)
-                task.steps.append(record)
-                await self.store.update_task(task)
                 raise
             except RetryError as e:
                 record.ok = False
                 record.error = f"tool failed after retries: {e}"
                 await metrics.inc("tool_failure", 1)
-                task.steps.append(record)
-                await self.store.update_task(task)
                 raise
             finally:
-                record.latency_ms = int((time.perf_counter() - step_t0) * 1000)
-            
-            await metrics.inc("tool_calls",1)
-            task.steps.append(record)
-            await self.store.update_task(task)
-        
-        # Final result (simple)
-        if observations:
-            task.result = f"Completed. Observations keys: {list(observations.keys())}"
-        else:
-            task.result = "Completed. No tools required. (Planner produced 0 steps. )"
-            
+                record.latency_ms = int((time.perf_counter() - s0) * 1000)
+                await self.store.append_step(task_id, record)
+                
 
     async def _call_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "http_get":
