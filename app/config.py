@@ -2,6 +2,8 @@ from pydantic import BaseModel
 import os
 
 class Settings(BaseModel):
+    redis_url: str = os.getenv("REDIS_URL","redis://localhost:6379/0")
+
     max_steps: int = int(os.getenv("APP_MAX_STEPS", "5"))
     step_timeout_seconds: float = float(os.getenv("APP_STEP_TIMEOUT_SECONDS","8"))
     max_concurrent_tasks: int = int(os.getenv("APP_MAX_CONCURRENT_TASKS", "10"))
@@ -11,5 +13,7 @@ class Settings(BaseModel):
     retry_base_attempts: float = float(os.getenv("APP_RETRY_BASE_ATTEMPTS","0.3"))
     retry_max_delay: float = float(os.getenv("APP_RETRY_MAX_DELAY","2.0"))
     retry_jitter: float = float(os.getenv("APP_RETRY_JITTER","0.2"))
+
+    openai_model: str = os.getenv("OPENAI_MODEL","gpt-4.1-mini")
 
 settings = Settings()
