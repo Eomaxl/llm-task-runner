@@ -1,24 +1,34 @@
 from __future__ import annotations
 from fastapi import FastAPI, Depends
-from .store import InMemoryStore
+import redis.asyncio as redis
+
+from .config import settings
 from .api import router
+from .redis_store import RedisStore
+from .redis_queue import RedisQueue
 from .worker import Worker
 
-app = FastAPI(title = "LLM Task Runner", version="0.1.0")
+app = FastAPI(title = "LLM Task Runner (Redis + OpenAI)", version="0.1.0")
 
-store = InMemoryStore()
-worker = Worker(store)
+r = redis.from_url(settings.redis_url, decode_responses=False)
+store = RedisStore(r)
+queue = RedisQueue(r)
+worker = Worker(store,queue)
 
-def get_store() -> InMemoryStore:
+def get_store() -> RedisStore:
     return store
 
+def get_queue() -> RedisQueue:
+    return queue
+
 @app.on_event("startup")
-async def on_startup():
+async def startup():
     worker.start()
 
 @app.on_event("shutdown")
-async def on_shutdown():
+async def shutdown():
     await worker.stop()
+    await r.aclose()
 
 # Dependency Injections of store into routes
 @app.middleware("http")
@@ -31,16 +41,7 @@ async def root():
     return {"service" : "llm-task-runner", "status":"running"}
 
 #Hook store into endpoints via Depends
-app.include_router(
-    router,
-    dependencies=[Depends(lambda: get_store())],
-)
+app.include_router(router)
 
-from fastapi import Request
-
-@app.middleware("http")
-async def bind_store_dependency(request: Request, call_next):
-    request.scope["fastapi_astack"] = getattr(request, "scope",{}).get("fastapi_astack")
-    return await call_next(request)
-
-app.dependency_overrides[InMemoryStore] = lambda: store
+app.dependency_overrides[RedisStore] = get_store
+app.dependency_overrides[RedisQueue] = get_queue
