@@ -3,6 +3,8 @@ from typing import Optional,Literal, Dict, List, Any
 from datetime import datetime
 import uuid
 
+TaskStatus = Literal["queued", "running", "succeeded", "failed"]
+
 class CreateTaskRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=10_000)
     idempotency_key: Optional[str] = Field(default=None, max_length=200)
